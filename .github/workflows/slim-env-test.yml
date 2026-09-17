@@ -1,9 +1,6 @@
 # TEST BRANCH ONLY - not for a PR to msys2/MINGW-packages.
-# Round 3: UCRT64 fails to link slim.exe with
-#   undefined reference to std::basic_filebuf<char>::_close()
-# SLiM's CMake already defaults to Release, so build type is not the cause (round 2).
-# This job reproduces the failure, then recompiles main.cpp alone under flag subsets
-# to find which makepkg flag makes the bad symbol appear.
+# Builds the real mingw-w64-slim-simulator PKGBUILD under each MSYS2 environment,
+# installs the resulting package, and runs SLiM's own self-tests.
 name: slim-env-test
 
 on:
@@ -11,8 +8,12 @@ on:
     branches: [test-slim-ucrt64-clang64]
 
 jobs:
-  diagnose:
-    name: UCRT64 diagnose
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        msystem: [UCRT64, CLANG64]
+    name: ${{ matrix.msystem }}
     runs-on: windows-2022
     defaults:
       run:
@@ -22,51 +23,62 @@ jobs:
         with:
           sparse-checkout: mingw-w64-slim-simulator
           persist-credentials: false
+
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: git base-devel
-      - name: Build (expected to fail at link)
-        continue-on-error: true
+
+      - name: Build package with makepkg-mingw
         run: |
           cd mingw-w64-slim-simulator
-          export MINGW_ARCH=ucrt64
-          makepkg-mingw --noconfirm --noprogressbar -sLf
-      - name: Which flag produces the _close reference?
+          export MINGW_ARCH="${MSYSTEM,,}"
+          makepkg-mingw --noconfirm --noprogressbar -sCLf
+
+      - name: Install the built package
         run: |
-          cd mingw-w64-slim-simulator/src/build-UCRT64
-          DEFS=$(sed -n 's/^CXX_DEFINES = //p' CMakeFiles/slim.dir/flags.make)
-          INCS=$(sed -n 's/^CXX_INCLUDES = //p' CMakeFiles/slim.dir/flags.make)
-          FLGS=$(sed -n 's/^CXX_FLAGS = //p' CMakeFiles/slim.dir/flags.make)
-          echo "FULL FLAGS: $FLGS"
-          try() {
-            label="$1"; shift
-            if eval g++ $DEFS $INCS "$@" -include config.h -c ../SLiM/core/main.cpp -o t.o 2>t.err; then
-              n=$(nm -C t.o | grep -c "basic_filebuf.*::_close" || true)
-              echo "[$label] undefined _close refs: $n"
-              nm -C t.o | grep -E "basic_filebuf<char.*::_?close" | sort -u | sed 's/^/      /'
-            else
-              echo "[$label] COMPILE FAILED"; head -5 t.err
-            fi
+          cd mingw-w64-slim-simulator
+          ls -la *.pkg.tar.zst
+          pacman --noconfirm -U *.pkg.tar.zst
+          pacman -Ql "${MINGW_PACKAGE_PREFIX}-slim-simulator"
+
+      - name: Which C runtime and C++ library did we link against?
+        run: |
+          for exe in slim eidos SLiMgui; do
+            echo "== ${exe}.exe"
+            objdump -p "${MINGW_PREFIX}/bin/${exe}.exe" | grep "DLL Name" | sort -u
+          done
+          echo "== unresolved DLLs for SLiMgui (should be empty)"
+          ldd "${MINGW_PREFIX}/bin/SLiMgui.exe" | grep -i "not found" || true
+
+      - name: Version and self-tests
+        run: |
+          slim -v
+          eidos -testEidos
+          slim -testEidos
+          slim -testSLiM
+
+      - name: Toy simulation
+        run: |
+          cat > toy.slim <<'EOF'
+          initialize() {
+            initializeMutationRate(1e-7);
+            initializeMutationType("m1", 0.5, "f", 0.0);
+            initializeGenomicElementType("g1", m1, 1.0);
+            initializeGenomicElement(g1, 0, 99999);
+            initializeRecombinationRate(1e-8);
           }
-          try "full makepkg flags" $FLGS
-          try "minus _FORTIFY_SOURCE" $(echo "$FLGS" | sed 's/-Wp,-D_FORTIFY_SOURCE=2//')
-          try "minus stack-protector" $(echo "$FLGS" | sed 's/-fstack-protector-strong//')
-          try "minus __USE_MINGW_ANSI_STDIO" $(echo "$FLGS" | sed 's/-Wp,-D__USE_MINGW_ANSI_STDIO=1//')
-          try "minus march/mtune/msahf" $(echo "$FLGS" | sed 's/-march=nocona//; s/-msahf//; s/-mtune=generic//')
-          try "minus leading -O2" $(echo "$FLGS" | sed 's/ -O2 / /')
-          try "SLiM CI style: CMake flags only" $(echo "$FLGS" | sed 's/.*-std=c++11/-std=c++11/')
-      - name: Where is close #defined, and does fstream see it?
-        run: |
-          cd mingw-w64-slim-simulator/src/build-UCRT64
-          DEFS=$(sed -n 's/^CXX_DEFINES = //p' CMakeFiles/slim.dir/flags.make)
-          INCS=$(sed -n 's/^CXX_INCLUDES = //p' CMakeFiles/slim.dir/flags.make)
-          FLGS=$(sed -n 's/^CXX_FLAGS = //p' CMakeFiles/slim.dir/flags.make)
-          eval g++ $DEFS $INCS $FLGS -include config.h -E -dD ../SLiM/core/main.cpp > main.i
-          echo "== every #define/#undef of close, with file"
-          awk '/^# [0-9]+ "/{f=$3} /^#(define|undef) close([ (]|$)/{print NR": "f": "$0}' main.i
-          echo "== line where <fstream> starts"
-          grep -n -m1 -E '^# 1 ".*/fstream"' main.i
-          echo "== filebuf close declarations as the compiler sees them"
-          grep -n -E "^\s*(close|_close)\(\)|__filebuf_type\* *$|_close\(\)" main.i | head -10
+          1 early() { sim.addSubpop("p1", 500); }
+          200 late() { catn("mutations: " + size(sim.mutations)); sim.simulationFinished(); }
+          EOF
+          slim toy.slim
+
+      - name: Upload package and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slim-${{ matrix.msystem }}
+          path: |
+            mingw-w64-slim-simulator/*.pkg.tar.zst
+            mingw-w64-slim-simulator/*.log

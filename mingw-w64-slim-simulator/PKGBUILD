@@ -2,7 +2,7 @@ _realname=slim-simulator
 pkgbase=mingw-w64-${_realname}
 pkgname="${MINGW_PACKAGE_PREFIX}-${_realname}"
 pkgver=5.2
-pkgrel=1
+pkgrel=2
 pkgdesc="SLiM forward simulation software package for population genetics (mingw-w64)"
 arch=('any')
 mingw_arch=('ucrt64' 'clang64')
@@ -14,9 +14,11 @@ makedepends=("${MINGW_PACKAGE_PREFIX}-autotools"
              "${MINGW_PACKAGE_PREFIX}-cmake")
 depends=("${MINGW_PACKAGE_PREFIX}-qt6-base")
 source=("https://github.com/MesserLab/SLiM/releases/download/v${pkgver}/SLiM.zip"
-        "0001-Remove-Qt-version-check.patch")
+        "0001-Remove-Qt-version-check.patch"
+        "0002-Compile-main.cpp-in-gnulib-namespace.patch")
 sha256sums=('8d3e943b897d93d871247d4ce5414ba136ef53174cf6a205ed817f74195c2a10'
-            '11679c3844de8d86b98f392ed1bf3711b15c7b5cc89eb2639c9e34fce3ede8c1')
+            '11679c3844de8d86b98f392ed1bf3711b15c7b5cc89eb2639c9e34fce3ede8c1'
+            'c3036eec19c73f49c9ccc7f128ae0f0775b5eb54880d5fbf064c2c5d76fcd299')
 
 # Helper macros to help make tasks easier #
 apply_patch_with_msg() {
@@ -31,7 +33,8 @@ prepare() {
   cd SLiM
 
   apply_patch_with_msg \
-    0001-Remove-Qt-version-check.patch
+    0001-Remove-Qt-version-check.patch \
+    0002-Compile-main.cpp-in-gnulib-namespace.patch
 }
 
 build() {

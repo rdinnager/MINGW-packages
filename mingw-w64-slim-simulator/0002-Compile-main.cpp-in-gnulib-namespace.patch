@@ -1,0 +1,17 @@
+Compile core/main.cpp with GNULIB_NAMESPACE, as upstream does since
+https://github.com/MesserLab/SLiM/commit/724b1ca3 (after 5.2).
+
+Without it gnulib's unistd.h does "#define close _close" before <fstream> is
+parsed, and with GCC 16 slim.exe fails to link:
+  undefined reference to std::basic_filebuf<char>::_close()
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -179,6 +179,7 @@
+     set(GNULIB_NAMESPACE_SOURCES "${PROJECT_SOURCE_DIR}/core/chromosome.cpp" 
+         "${PROJECT_SOURCE_DIR}/core/haplosome.cpp" 
+         "${PROJECT_SOURCE_DIR}/core/individual.cpp" 
++        "${PROJECT_SOURCE_DIR}/core/main.cpp"
+         "${PROJECT_SOURCE_DIR}/core/population.cpp"
+         "${PROJECT_SOURCE_DIR}/core/slim_globals.cpp"
+         "${PROJECT_SOURCE_DIR}/core/slim_sim_eidos.cpp"
