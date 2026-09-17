@@ -1,8 +1,9 @@
 # TEST BRANCH ONLY - not for a PR to msys2/MINGW-packages.
-# Round 2: CLANG64 passed in round 1; UCRT64 failed to link slim.exe with
+# Round 3: UCRT64 fails to link slim.exe with
 #   undefined reference to std::basic_filebuf<char>::_close()
-# Job "diagnose" reproduces that and finds where `close` is being #defined.
-# Job "release" tests whether -DCMAKE_BUILD_TYPE=Release avoids it, then runs the self-tests.
+# SLiM's CMake already defaults to Release, so build type is not the cause (round 2).
+# This job reproduces the failure, then recompiles main.cpp alone under flag subsets
+# to find which makepkg flag makes the bad symbol appear.
 name: slim-env-test
 
 on:
@@ -32,69 +33,40 @@ jobs:
           cd mingw-w64-slim-simulator
           export MINGW_ARCH=ucrt64
           makepkg-mingw --noconfirm --noprogressbar -sLf
-      - name: Where does the close macro come from?
+      - name: Which flag produces the _close reference?
         run: |
           cd mingw-w64-slim-simulator/src/build-UCRT64
-          echo "== makepkg flags"; grep -E "^(CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS)=" /etc/makepkg_mingw.conf || true
-          echo "== flags.make for slim"; cat CMakeFiles/slim.dir/flags.make
           DEFS=$(sed -n 's/^CXX_DEFINES = //p' CMakeFiles/slim.dir/flags.make)
           INCS=$(sed -n 's/^CXX_INCLUDES = //p' CMakeFiles/slim.dir/flags.make)
           FLGS=$(sed -n 's/^CXX_FLAGS = //p' CMakeFiles/slim.dir/flags.make)
-          eval g++ $DEFS $INCS $FLGS -E -dD ../SLiM/core/main.cpp > main.i
-          echo "== every #define/#undef of close or _close, with the header it sits in"
-          awk '/^# [0-9]+ "/{f=$3} /^#(define|undef) (close|_close)([ (]|$)/{print f": "$0}' main.i
-          echo "== first mention of basic_filebuf close"
-          grep -n -m5 -E "_close *\(|[^f_]close *\(\)" main.i | head -10 || true
-          echo "== order in which fstream and unistd.h arrive"
-          grep -n -E '^# 1 ".*(/fstream|unistd\.h|/io\.h)"' main.i | head -12
-      - name: Same preprocessing with SLiM CI's Release flags, for comparison
+          echo "FULL FLAGS: $FLGS"
+          try() {
+            label="$1"; shift
+            if eval g++ $DEFS $INCS "$@" -include config.h -c ../SLiM/core/main.cpp -o t.o 2>t.err; then
+              n=$(nm -C t.o | grep -c "basic_filebuf.*::_close" || true)
+              echo "[$label] undefined _close refs: $n"
+              nm -C t.o | grep -E "basic_filebuf<char.*::_?close" | sort -u | sed 's/^/      /'
+            else
+              echo "[$label] COMPILE FAILED"; head -5 t.err
+            fi
+          }
+          try "full makepkg flags" $FLGS
+          try "minus _FORTIFY_SOURCE" $(echo "$FLGS" | sed 's/-Wp,-D_FORTIFY_SOURCE=2//')
+          try "minus stack-protector" $(echo "$FLGS" | sed 's/-fstack-protector-strong//')
+          try "minus __USE_MINGW_ANSI_STDIO" $(echo "$FLGS" | sed 's/-Wp,-D__USE_MINGW_ANSI_STDIO=1//')
+          try "minus march/mtune/msahf" $(echo "$FLGS" | sed 's/-march=nocona//; s/-msahf//; s/-mtune=generic//')
+          try "minus leading -O2" $(echo "$FLGS" | sed 's/ -O2 / /')
+          try "SLiM CI style: CMake flags only" $(echo "$FLGS" | sed 's/.*-std=c++11/-std=c++11/')
+      - name: Where is close #defined, and does fstream see it?
         run: |
           cd mingw-w64-slim-simulator/src/build-UCRT64
           DEFS=$(sed -n 's/^CXX_DEFINES = //p' CMakeFiles/slim.dir/flags.make)
           INCS=$(sed -n 's/^CXX_INCLUDES = //p' CMakeFiles/slim.dir/flags.make)
-          eval g++ $DEFS $INCS -O3 -DNDEBUG -std=c++11 -E -dD ../SLiM/core/main.cpp > main_rel.i
-          awk '/^# [0-9]+ "/{f=$3} /^#(define|undef) (close|_close)([ (]|$)/{print f": "$0}' main_rel.i
-
-  release:
-    name: UCRT64 with CMAKE_BUILD_TYPE=Release
-    runs-on: windows-2022
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: mingw-w64-slim-simulator
-          persist-credentials: false
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
-        with:
-          msystem: UCRT64
-          update: true
-          install: git base-devel
-      - name: Build package with CMAKE_BUILD_TYPE=Release
-        run: |
-          cd mingw-w64-slim-simulator
-          sed -i 's/^\( *\)-DBUILD_SLIMGUI=ON \\$/\1-DBUILD_SLIMGUI=ON \\\n\1-DCMAKE_BUILD_TYPE=Release \\/' PKGBUILD
-          sed -n '/^build()/,/^}/p' PKGBUILD
-          export MINGW_ARCH=ucrt64
-          makepkg-mingw --noconfirm --noprogressbar --skipinteg -sLf
-      - name: Install, inspect, self-test
-        run: |
-          cd mingw-w64-slim-simulator
-          pacman --noconfirm -U *.pkg.tar.zst
-          for exe in slim eidos SLiMgui; do
-            echo "== ${exe}.exe"; objdump -p "${MINGW_PREFIX}/bin/${exe}.exe" | grep "DLL Name" | sort -u
-          done
-          ldd "${MINGW_PREFIX}/bin/SLiMgui.exe" | grep -i "not found" || true
-          slim -v
-          eidos -testEidos
-          slim -testEidos
-          slim -testSLiM
-      - name: Upload package and build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: slim-UCRT64-release
-          path: |
-            mingw-w64-slim-simulator/*.pkg.tar.zst
-            mingw-w64-slim-simulator/*.log
+          FLGS=$(sed -n 's/^CXX_FLAGS = //p' CMakeFiles/slim.dir/flags.make)
+          eval g++ $DEFS $INCS $FLGS -include config.h -E -dD ../SLiM/core/main.cpp > main.i
+          echo "== every #define/#undef of close, with file"
+          awk '/^# [0-9]+ "/{f=$3} /^#(define|undef) close([ (]|$)/{print NR": "f": "$0}' main.i
+          echo "== line where <fstream> starts"
+          grep -n -m1 -E '^# 1 ".*/fstream"' main.i
+          echo "== filebuf close declarations as the compiler sees them"
+          grep -n -E "^\s*(close|_close)\(\)|__filebuf_type\* *$|_close\(\)" main.i | head -10
