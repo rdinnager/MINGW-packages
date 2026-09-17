@@ -1,6 +1,8 @@
 # TEST BRANCH ONLY - not for a PR to msys2/MINGW-packages.
-# Builds the real mingw-w64-slim-simulator PKGBUILD under each MSYS2 environment,
-# installs the resulting package, and runs SLiM's own self-tests.
+# Round 2: CLANG64 passed in round 1; UCRT64 failed to link slim.exe with
+#   undefined reference to std::basic_filebuf<char>::_close()
+# Job "diagnose" reproduces that and finds where `close` is being #defined.
+# Job "release" tests whether -DCMAKE_BUILD_TYPE=Release avoids it, then runs the self-tests.
 name: slim-env-test
 
 on:
@@ -8,12 +10,8 @@ on:
     branches: [test-slim-ucrt64-clang64]
 
 jobs:
-  build-and-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        msystem: [UCRT64, CLANG64]
-    name: ${{ matrix.msystem }}
+  diagnose:
+    name: UCRT64 diagnose
     runs-on: windows-2022
     defaults:
       run:
@@ -23,62 +21,80 @@ jobs:
         with:
           sparse-checkout: mingw-w64-slim-simulator
           persist-credentials: false
-
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         with:
-          msystem: ${{ matrix.msystem }}
+          msystem: UCRT64
           update: true
           install: git base-devel
-
-      - name: Build package with makepkg-mingw
+      - name: Build (expected to fail at link)
+        continue-on-error: true
         run: |
           cd mingw-w64-slim-simulator
-          export MINGW_ARCH="${MSYSTEM,,}"
-          makepkg-mingw --noconfirm --noprogressbar -sCLf
+          export MINGW_ARCH=ucrt64
+          makepkg-mingw --noconfirm --noprogressbar -sLf
+      - name: Where does the close macro come from?
+        run: |
+          cd mingw-w64-slim-simulator/src/build-UCRT64
+          echo "== makepkg flags"; grep -E "^(CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS)=" /etc/makepkg_mingw.conf || true
+          echo "== flags.make for slim"; cat CMakeFiles/slim.dir/flags.make
+          DEFS=$(sed -n 's/^CXX_DEFINES = //p' CMakeFiles/slim.dir/flags.make)
+          INCS=$(sed -n 's/^CXX_INCLUDES = //p' CMakeFiles/slim.dir/flags.make)
+          FLGS=$(sed -n 's/^CXX_FLAGS = //p' CMakeFiles/slim.dir/flags.make)
+          eval g++ $DEFS $INCS $FLGS -E -dD ../SLiM/core/main.cpp > main.i
+          echo "== every #define/#undef of close or _close, with the header it sits in"
+          awk '/^# [0-9]+ "/{f=$3} /^#(define|undef) (close|_close)([ (]|$)/{print f": "$0}' main.i
+          echo "== first mention of basic_filebuf close"
+          grep -n -m5 -E "_close *\(|[^f_]close *\(\)" main.i | head -10 || true
+          echo "== order in which fstream and unistd.h arrive"
+          grep -n -E '^# 1 ".*(/fstream|unistd\.h|/io\.h)"' main.i | head -12
+      - name: Same preprocessing with SLiM CI's Release flags, for comparison
+        run: |
+          cd mingw-w64-slim-simulator/src/build-UCRT64
+          DEFS=$(sed -n 's/^CXX_DEFINES = //p' CMakeFiles/slim.dir/flags.make)
+          INCS=$(sed -n 's/^CXX_INCLUDES = //p' CMakeFiles/slim.dir/flags.make)
+          eval g++ $DEFS $INCS -O3 -DNDEBUG -std=c++11 -E -dD ../SLiM/core/main.cpp > main_rel.i
+          awk '/^# [0-9]+ "/{f=$3} /^#(define|undef) (close|_close)([ (]|$)/{print f": "$0}' main_rel.i
 
-      - name: Install the built package
+  release:
+    name: UCRT64 with CMAKE_BUILD_TYPE=Release
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: mingw-w64-slim-simulator
+          persist-credentials: false
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: UCRT64
+          update: true
+          install: git base-devel
+      - name: Build package with CMAKE_BUILD_TYPE=Release
         run: |
           cd mingw-w64-slim-simulator
-          ls -la *.pkg.tar.zst
+          sed -i 's/^\( *\)-DBUILD_SLIMGUI=ON \\$/\1-DBUILD_SLIMGUI=ON \\\n\1-DCMAKE_BUILD_TYPE=Release \\/' PKGBUILD
+          sed -n '/^build()/,/^}/p' PKGBUILD
+          export MINGW_ARCH=ucrt64
+          makepkg-mingw --noconfirm --noprogressbar --skipinteg -sLf
+      - name: Install, inspect, self-test
+        run: |
+          cd mingw-w64-slim-simulator
           pacman --noconfirm -U *.pkg.tar.zst
-          pacman -Ql "${MINGW_PACKAGE_PREFIX}-slim-simulator"
-
-      - name: Which C runtime and C++ library did we link against?
-        run: |
           for exe in slim eidos SLiMgui; do
-            echo "== ${exe}.exe"
-            objdump -p "${MINGW_PREFIX}/bin/${exe}.exe" | grep "DLL Name" | sort -u
+            echo "== ${exe}.exe"; objdump -p "${MINGW_PREFIX}/bin/${exe}.exe" | grep "DLL Name" | sort -u
           done
-          echo "== unresolved DLLs for SLiMgui (should be empty)"
           ldd "${MINGW_PREFIX}/bin/SLiMgui.exe" | grep -i "not found" || true
-
-      - name: Version and self-tests
-        run: |
           slim -v
           eidos -testEidos
           slim -testEidos
           slim -testSLiM
-
-      - name: Toy simulation
-        run: |
-          cat > toy.slim <<'EOF'
-          initialize() {
-            initializeMutationRate(1e-7);
-            initializeMutationType("m1", 0.5, "f", 0.0);
-            initializeGenomicElementType("g1", m1, 1.0);
-            initializeGenomicElement(g1, 0, 99999);
-            initializeRecombinationRate(1e-8);
-          }
-          1 early() { sim.addSubpop("p1", 500); }
-          200 late() { catn("mutations: " + size(sim.mutations)); sim.simulationFinished(); }
-          EOF
-          slim toy.slim
-
       - name: Upload package and build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: slim-${{ matrix.msystem }}
+          name: slim-UCRT64-release
           path: |
             mingw-w64-slim-simulator/*.pkg.tar.zst
             mingw-w64-slim-simulator/*.log
